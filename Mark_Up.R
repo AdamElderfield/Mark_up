@@ -5,6 +5,7 @@ library(readabs)
 library(dplyr)
 library(tidyverse)
 library(KFAS)
+library(tempdisagg)
 
 
 #**********************
@@ -19,6 +20,9 @@ LA_DATA <- readabs::read_abs("6150.0.55.003")
 
 # Labour Force
 LF_DATA <- readabs::read_abs("6202")
+
+# Annual national accounts
+KT_DATA <- readabs::read_abs("5204.0")
 
 #  Payments; Average hourly income per Labour Account employed person ;  Australia ;  Agriculture, forestry and fishing (A) ;  
 
@@ -78,21 +82,32 @@ Y_L_W_P <- NA_DATA %>%
               rename(PGDP = value)) %>%
   left_join(LF_DATA %>% 
              
-              filter(series_id %in% c("A84426277X", "A84423091W")) %>% 
+              filter(series_id %in% ("A84423091W")) %>% #c("A84426277X" 
               mutate(year = year(date),
                      quarter = quarter(date)) %>%
               group_by(year,quarter,series) %>% 
               summarise(value = mean(value)) %>%
               spread(series,value) %>% 
-              rename(POP15 = 3,
-                     THW = 5) %>% 
+              rename(POP15 = 3) %>% 
               mutate(date = as.Date(paste0(year,"-",quarter*3,"-01"))) %>% 
               ungroup() %>% 
-              select(date,POP15, THW)) %>% 
+              select(date,POP15)) %>%
+  left_join(LF_DATA %>% 
+  filter(series_id %in% ("A84426277X")) %>% #c("A84426277X" 
+  mutate(year = year(date),
+         quarter = quarter(date)) %>%
+  group_by(year,quarter,series) %>% 
+  summarise(value = sum(value)) %>%
+  spread(series,value) %>% 
+  rename(THW = 3) %>% 
+  mutate(date = as.Date(paste0(year,"-",quarter*3,"-01"))) %>% 
+  ungroup() %>% 
+  select(date,THW)) %>%
+  
   mutate(INFL = PCONH/lag(PCONH,4)*100-100) %>% 
   mutate(PROD = Output/THW*1000) %>%
-  mutate(TWH_POP = THW/POP15,
-         AENA_H = COE/THW*1000)
+  mutate(THW_POP = THW/POP15,
+         AENA_H = COE/THW*1000) %>% 
   
   filter(!is.na(PROD)) %>% 
 
@@ -105,16 +120,20 @@ Y_L_W_P <- NA_DATA %>%
   
   
 dat <- Y_L_W_P %>% 
-  select(date, INFL,INFE, PROD, PROD_T, AENA_H, TWH_POP) %>% 
+  select(date, INFL,INFE, PROD, PROD_T, AENA_H, THW_POP, Output, PGDP, Hours, COE) %>% 
   mutate(AENA_H = AENA_H/lag(AENA_H)*100-100,
          PROD_T = PROD_T/lag(PROD_T)*100-100,
          PROD = PROD/lag(PROD)*100-100,
          INFE = (1+INFE/100)^(1/4)*100-100,
-         INFL = (1+INFL/100)^(1/4)*100-100) 
+         INFL = (1+INFL/100)^(1/4)*100-100,
+         N_SHARE = mean(COE[.$date>="2022-09-01"&.$date<="2023-06-01"]/(Output[.$date>="2022-09-01"&.$date<="2023-06-01"]*(PGDP[.$date>="2022-09-01"&.$date<="2023-06-01"]/100)))) 
 
 #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 # State space model for wages - trend input
 #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+# W = P* + INFE + GAP
+# N = -P* + Y +sigma*(W/P)
 
 # State space model is of the form:
 #    Y(t) = Z(t)*A(t) + H
@@ -163,7 +182,7 @@ Z[2, 2, 1:Ti] <- 1.0
 T <- diag(4) 
 T[1, 1] <- NA 
 
-  Q <- diag(c(NA,NA,NA,NA))
+Q <- diag(c(NA,NA,NA,NA))
 
 P1inf <- diag(1,4) 
 P1inf[1,1] <- 0
@@ -176,11 +195,9 @@ a1 <- c(0,0,0,0)
 wages_mod <- SSModel(Y ~ -1 + SSMcustom(Z = Z, T = T, Q = Q,a1 =a1,  P1 = P1, P1inf = P1inf,
                                      state_names = c("gap", "nht*","b", "c")), H = diag( c(NA,0), 2))
 
-fitSSM(wages_mod,c(0,0,0,0,0))
-
 
 # *********************************************************************
-# Constrained optimistion
+# parameter optimistion
 # *********************************************************************
 
 # Set up objective function
@@ -191,9 +208,9 @@ objf <- function(params, model, estimate = TRUE) {
   
   model$T[,,1][1,1] <- params[2]
   
-  diag(model$Q[,,1]) <- c(params[3]^2, (params[4]^2),0,0)
+  diag(model$Q[,,1]) <- c(params[3]^2, 0.01*(params[3]^2),0,0)
   
-  model$H[,,1][1,1] <- (params[5])^2
+  model$H[,,1][1,1] <- (params[4])^2
   
   
   if (estimate) {
@@ -205,26 +222,137 @@ objf <- function(params, model, estimate = TRUE) {
 
 
 # Optimise hyperparameters
-opt <- optim(c(0.5,0.8,0.1,0.1,0.1), objf, method = "L-BFGS-B",
+opt <- optim(c(0.5,0.5,0.5,0.1), objf, method = "L-BFGS-B",
                
                model = wages_mod,  control =list(trace = 6, REPORT = 5, maxit = 1000), hessian = TRUE)
 
 
 
 # Paramaterise model
-wages_model_opt <- objf15(opt$par, wages_mod, estimate = FALSE)
+wages_model_opt <- objf(opt$par, wages_mod, estimate = FALSE)
 
 # Estimate diagnostics
 se_15 <- diag(sqrt(solve(opt15$hessian)))
 
-# #params_15 <- tibble(Parameter = c("RHO","SIGMA_GAP^2","SIGMA_U^2","SIGMA_KAPPA^2","SIGMA_THETA^2","SIGMA_GAMMA^2","SIGMA_PI^2"),
-#                     Estimate = c(opt15$par[1],15*opt15$par[2],opt15$par[-1]),
-#                     SE = c(se_15[1],se_15[2],se_15[2],se_15[3:6]),
-#                     T_Stat = Estimate/SE)
+
+
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# State space model for wages + Labour demand - trend input
+#^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+# W = P* + INFE + GAP
+# N/pop =  Nshare -P* + Y/pop +sigma*(W/P)
+
+# State space model is of the form:
+#    Y(t) = Z(t)*A(t) + H
+#    A(t+1) = T*A(t) +  Q
+
+# A = [gap,H*, a1, P, d, gap]  = 5x1
+# n = T x 4
+
+
+# Y = [Ti x n]
+# Z = [n x m]
+# A = [m x 1]
+# T = [m x m]
+# H = [n x n]
+# Q = [m x m]
+
+# T = [a, 0, 0, 0, 
+#      0, 1, 0, 0, 
+#      0, 0, 1, 0, 
+#      0, 0, 0, 1,]
+
+
+
+Ti <- dim(dat)[1]
+Y <- matrix(NA,Ti,3)
+Int <- matrix(NA,Ti,3)
+
+Y[1:Ti,1] <- dat$AENA_H-dat$INFE
+Y[1:Ti,2] <- dat$TWH_POP
+Y[1:Ti,3] <- dat$PROD
 
 
 
 
+# Set up the time varing Z matrix (fill it with out exogenous variables)
+Z <- array(0, c(3, 6, Ti))
+
+
+# wages measurement equation  a*gap + b*(pr-pr*) + c*(pi-pi*) 
+Z[1, 1, 1:Ti] <-  NA # hours gap
+Z[1, 2, 1:Ti] <-  0.0  # 
+Z[1, 3, 1:Ti] <- (dat$INFL-dat$INFE)
+Z[1, 5, 1:Ti] <-  NA  # prod gap
+
+
+# total hours measurement equation u = u* + gap
+Z[2, 1, 1:Ti] <- 1.0
+Z[2, 2, 1:Ti] <- 1.0
+
+
+# Prod gap measurement equation u = u* + gap
+Z[3, 4, 1:Ti] <- 1.0
+Z[3, 6, 1:Ti] <- 1.0
+
+
+
+# Set up the time invariant T matrix 
+T <- diag(4) 
+T[1, 1] <- NA 
+
+Q <- diag(c(NA,NA,NA,NA))
+
+P1inf <- diag(1,4) 
+P1inf[1,1] <- 0
+
+
+P1 <- diag(0,4)
+
+a1 <- c(0,0,0,0)
+
+wages_mod <- SSModel(Y ~ -1 + SSMcustom(Z = Z, T = T, Q = Q,a1 =a1,  P1 = P1, P1inf = P1inf,
+                                        state_names = c("gap", "nht*","b", "c")), H = diag( c(NA,0), 2))
+
+
+# *********************************************************************
+# parameter optimistion
+# *********************************************************************
+
+# Set up objective function
+
+objf <- function(params, model, estimate = TRUE) {
+  
+  model$Z[1,1,] <- params[1]                       
+  
+  model$T[,,1][1,1] <- params[2]
+  
+  diag(model$Q[,,1]) <- c(params[3]^2, 0.01*(params[3]^2),0,0)
+  
+  model$H[,,1][1,1] <- (params[4])^2
+  
+  
+  if (estimate) {
+    -logLik(model)
+  } else {
+    model
+  }
+}
+
+
+# Optimise hyperparameters
+opt <- optim(c(0.5,0.5,0.5,0.1), objf, method = "L-BFGS-B",
+             
+             model = wages_mod,  control =list(trace = 6, REPORT = 5, maxit = 1000), hessian = TRUE)
+
+
+
+# Paramaterise model
+wages_model_opt <- objf(opt$par, wages_mod, estimate = FALSE)
+
+# Estimate diagnostics
+se_15 <- diag(sqrt(solve(opt15$hessian)))
 
 #-----------------------------------------------------------------------------------------
 # Run Kalman filter and smoother
@@ -232,6 +360,90 @@ se_15 <- diag(sqrt(solve(opt15$hessian)))
 
 dlm_wages <- KFS(wages_model_opt)
 
+#-----------------------------------------------------------------------------------------
+# Mark-ups and the labour income share
+#-----------------------------------------------------------------------------------------
+
+# For rental rate on capital, used to derive the markup we need 
+# p_cap (price deflator on capital stock)
+# depreciation rate
+# nominal interest rate (10 yr bond?)
+# gdp deflator
+# R = pk/p*(i - dlog(pk)+dep)
+
+Annual_KT <- KT_DATA %>% 
+  filter(table_title == "Table 56. Capital Stock, by Type of asset") %>% 
+  filter(series %in% c("End-year net capital stock: Chain volume measures ;",
+                       "End-year net capital stock: Current prices ;")) %>% 
+  select(date, value, series) %>% 
+  spread(series, value)
+
+
+Qtrly_Inv <-  NA_DATA %>% 
+  filter(table_title %in% c("Table 2. Expenditure on Gross Domestic Product (GDP), Chain volume measures",
+                           "Table 3. Expenditure on Gross Domestic Product (GDP), Current prices")) %>% 
+  filter(series == "All sectors ;  Gross fixed capital formation ;") %>% 
+  filter(series_type == "Seasonally Adjusted") %>%
+  mutate(Var = if_else(table_title =="Table 2. Expenditure on Gross Domestic Product (GDP), Chain volume measures", "IT","ITZ")) %>% 
+  select(date, value, Var) %>% 
+  spread(Var, value) %>% 
+  mutate(PIT = ITZ/IT)
+
+QTRLY_KT <- list()
+for(i in c(1,2)){
+  
+  Annual_series <- ts(Annual_KT[[i+1]], start = year(Annual_KT$date[1]))
+  indic <- ts(Qtrly_Inv[[i+1]], start = c(year(Qtrly_Inv$date[1]),quarter(Qtrly_Inv$date[1])), frequency = 4)
+  
+  disag_out <- tempdisagg::td(Annual_series~-1+indic,conversion = "sum", to = "quarter")
+  
+  QTRLY_KT[[i]] <- disag_out %>% predict()
+  
+}
+
+# Replace with data download when 
+
+m <- tst.macrodata()$m
+
+
+RR_Data <- tibble(date = Y_L_W_P$date) %>% 
+  left_join(Qtrly_Inv) %>% 
+  left_join(tibble(KT = QTRLY_KT[[1]],
+                   date = seq.Date(ymd("1959-09-01"),length.out = length(QTRLY_KT[[1]]), by = "quarter"))) %>%
+  left_join(tibble(KTZ = QTRLY_KT[[2]],
+                   date = seq.Date(ymd("1959-09-01"),length.out = length(QTRLY_KT[[1]]), by = "quarter"))) %>%
+ mutate(PKT = KTZ/KT) %>%
+  left_join(Y_L_W_P %>% 
+              mutate(PGDP = PGDP/100) %>% 
+              select(date, PGDP)) %>%
+  left_join(m %>%
+              rename(date = Date) %>% 
+              select(date, rate_10))
+
+  
+
+Dep <-  KT_DATA %>% 
+  filter(table_title == "Table 56. Capital Stock, by Type of asset") %>% 
+  filter(series %in% c("Consumption of fixed capital: Current prices ;",
+                       "End-year net capital stock: Current prices ;")) %>% 
+  select(date, value, series) %>% 
+  spread(series, value) %>% 
+  mutate(Dep_rate = .[[2]]/lag(.[[3]])) %>%
+  filter(date %in% RR_Data$date) %>% 
+  summarise(Dep_rate = mean(Dep_rate, na.rm = T))
+
+# R = pk/p*(i - dlog(pk)+dep)
+
+RR_Data <- RR_Data %>% 
+  mutate(R = 100*(PIT/PGDP*((rate_10/100)-(PIT/lag(PIT,4)-1) + Dep[[1]])))
+
+RR_Data %>%
+  
+  select(date,R, rate_10) %>% 
+  gather(Var, Val, -date) %>% 
+  tst.plot_line(aes(date, Val, colour = Var))
+
+# MGR
 
 
 
@@ -290,6 +502,8 @@ Y_L_W_P_M <- NA_DATA %>%
               select(date,value) %>% 
               rename(PGDP = value)) %>% 
   left_join(Median_E) %>% 
+  left_join(RR_Data %>% 
+              select(-PGDP)) %>% 
   mutate(Median_HE = zoo::na.spline(Median_HE)) %>% 
   mutate(Median_HE = ifelse(Median_HE < 0.01,NA,Median_HE)) %>%
   mutate(AENA_H = COE*1000/Hours) %>% 
@@ -298,12 +512,13 @@ Y_L_W_P_M <- NA_DATA %>%
          #Hours_Share = Hours/Hours_TOTAL*100, # TODO Add
          YGAP = Output/Trend*100-100,  # TODO
          Prod = Output/Hours, 
-         Mark_up = Prod/(AENA_H/PGDP)) %>%
-  filter(!is.na(Mark_up)) %>% 
+         Mark_up_1 = Prod/(AENA_H/(PGDP)),
+         Mark_up = 1-(COE/((PGDP/100)*Output))-(R/100)*(KT/Output)) %>%
+#  filter(!is.na(Mark_up)) %>% 
   mutate(O_remove = forecast::tsclean(ts(Mark_up, f = 4)) ) %>% # M-PR+A = Pr-A+P
   #mutate(O_remove = tsoutliers::tso(ts(.$value, f = 4)) %>% .[[3]]) %>%
   mutate(Trend_MU = stl(ts(O_remove, f = 4), s.window = "per", t.window = 60)$time.series[,2]) %>% 
-  mutate(MGAP = Mark_up/Trend_MU*100-100 ) %>% 
+  mutate(MGAP = (Mark_up-Trend_MU)*100 ) %>% 
   left_join(tibble(date = dat$date,
                    LGAP = dlm_wages$alphahat[,"gap"]))
   
@@ -350,7 +565,7 @@ BEV_C <- Y_L_W_P_M %>%
   ggplot(aes(UNE_Rate, Vac_Rate, colour = Year)) +
   geom_point(size = 4) + 
   tst_theme()+
-  scale_colour_tst(discrete = T, palette = "mixed")+
+  scale_colour_tst(discrete = TRUE, palette = "mixed")+
   ggtitle("Beveridge curve")
 
 
@@ -384,7 +599,7 @@ PGVA_DECOMP_Chart <-  PGDP_DECOMP_dat %>%
   geom_line(data =PGDP_DECOMP_dat %>% 
               filter(Var == "PGDP"), aes(date, Val), colour = "purple", size =1)+
   tst_theme()+
-  scale_fill_tst(discrete = T)+
+  scale_fill_tst(discrete = TRUE)+
   ggtitle("Output price decomposition")
 
 (WP_PROD+BEV_C)/(MARK_UP_YGAP+PGVA_DECOMP_Chart)
